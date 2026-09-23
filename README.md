@@ -15,6 +15,8 @@ cargo build --release
 cargo install --path . --locked
 ```
 
+Release builds optimize for size, use thin LTO and a single codegen unit, and strip symbols. This favors smaller binaries over peak runtime performance and build speed. CLI help and errors use plain text without optional color support; the terminal spinner is unchanged.
+
 ## Configuration
 
 For Gemini, start with `mdtrans login gemini`: it prompts for a hidden API key, fetches models, and lets you choose one. You can also create `mdtrans/config.toml` manually in your operating system's configuration directory:
