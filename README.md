@@ -2,6 +2,9 @@
 
 A minimal Rust CLI for translating Markdown with AI. Opens the translation in `$EDITOR` using a temporary file; with `--stdout`, prints the Markdown to the console. Never modifies the input file.
 
+> [!WARNING]
+> **Work in progress.** mdtrans is under active development. Commands and configuration may change without notice, and breaking changes should be expected before v1.0.
+
 ## Installation
 
 Requires stable Rust with support for the 2024 edition.
