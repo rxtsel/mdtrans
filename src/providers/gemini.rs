@@ -1,11 +1,11 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, ops::ControlFlow, pin::Pin};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Url, header::HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::translate::{TranslationError, TranslationRequest, Translator};
+use crate::translate::{TextSink, TranslationError, TranslationRequest, Translator};
 
 pub struct Gemini {
     client: Client,
@@ -54,6 +54,92 @@ impl Translator for Gemini {
             .await?;
             response.markdown()
         })
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: TranslationRequest<'a>,
+        on_text: &'a mut TextSink<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TranslationError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut endpoint = self.endpoint.clone();
+            endpoint.set_path(&format!(
+                "{}:streamGenerateContent",
+                endpoint.path().trim_end_matches(":generateContent")
+            ));
+            endpoint.query_pairs_mut().append_pair("alt", "sse");
+            let mut state = StreamState::default();
+            super::sse::consume(
+                self.client
+                    .post(endpoint)
+                    .header("x-goog-api-key", self.key.clone())
+                    .json(&Self::body(&request)),
+                |data| state.handle(data, on_text),
+            )
+            .await
+        })
+    }
+}
+
+#[derive(Default)]
+struct StreamState {
+    has_text: bool,
+}
+
+impl StreamState {
+    fn handle(
+        &mut self,
+        data: &str,
+        on_text: &mut TextSink<'_>,
+    ) -> Result<ControlFlow<()>, TranslationError> {
+        let response: Response = super::sse::json(data)?;
+        if response
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.as_deref())
+            .is_some_and(|reason| reason != "BLOCK_REASON_UNSPECIFIED")
+        {
+            return Err(TranslationError::InvalidResponse(
+                "Gemini blocked the translation",
+            ));
+        }
+        let Some(candidate) = response
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.index == 0)
+        else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        if candidate
+            .finish_reason
+            .as_deref()
+            .is_some_and(|reason| !matches!(reason, "STOP" | "FINISH_REASON_UNSPECIFIED"))
+        {
+            return Err(TranslationError::InvalidResponse(
+                "Gemini generation incomplete or blocked (expected finishReason=STOP)",
+            ));
+        }
+        if let Some(content) = candidate.content {
+            for text in content
+                .parts
+                .into_iter()
+                .filter(|part| !part.thought)
+                .filter_map(|part| part.text)
+                .filter(|text| !text.is_empty())
+            {
+                self.has_text |= !text.trim().is_empty();
+                on_text(&text)?;
+            }
+        }
+        if candidate.finish_reason.as_deref() == Some("STOP") {
+            if !self.has_text {
+                return Err(TranslationError::InvalidResponse(
+                    "missing or empty Gemini text",
+                ));
+            }
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -133,13 +219,22 @@ impl Model {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Response {
     #[serde(default)]
     candidates: Vec<Candidate>,
+    prompt_feedback: Option<PromptFeedback>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptFeedback {
+    block_reason: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Candidate {
+    #[serde(default)]
+    index: usize,
     finish_reason: Option<String>,
     content: Option<Content>,
 }
@@ -212,6 +307,17 @@ mod tests {
     }
 
     fn model_server(pages: Vec<(u16, Value)>) -> (Url, std::thread::JoinHandle<Vec<String>>) {
+        http_server(
+            pages
+                .into_iter()
+                .map(|(status, body)| (status, "application/json", body.to_string()))
+                .collect(),
+        )
+    }
+
+    fn http_server(
+        pages: Vec<(u16, &'static str, String)>,
+    ) -> (Url, std::thread::JoinHandle<Vec<String>>) {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -227,7 +333,7 @@ mod tests {
         .unwrap();
         let handle = thread::spawn(move || {
             let mut requests = Vec::new();
-            for (status, body) in pages {
+            for (status, content_type, body) in pages {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
@@ -245,15 +351,28 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut bytes = Vec::new();
-                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                loop {
                     let mut buffer = [0; 1024];
                     let size = stream.read(&mut buffer).unwrap();
                     assert!(size > 0 && bytes.len() < 16384);
                     bytes.extend_from_slice(&buffer[..size]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
                 }
                 requests.push(String::from_utf8(bytes).unwrap());
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
             requests
         });
@@ -329,6 +448,150 @@ mod tests {
                 .contains("repeated page token")
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streams_over_local_http_using_native_endpoint_and_header_auth() {
+        let events = [
+            json!({"candidates": [{"content": {"parts": [{"thought": true, "text": "private"}, {"text": "# Hola"}]}}]}),
+            json!({"candidates": [{"content": {"parts": [{"text": "\n"}]}, "finishReason": "STOP"}]}),
+        ].into_iter().map(|event| format!("data: {event}\n\n")).collect();
+        let (url, server) = http_server(vec![(200, "text/event-stream", events)]);
+        let mut provider = Gemini::new(
+            Client::builder().no_proxy().build().unwrap(),
+            "gemini-test",
+            "fake-secret",
+        )
+        .unwrap();
+        provider.endpoint = url
+            .join("/v1beta/models/gemini-test:generateContent")
+            .unwrap();
+        let mut fragments = Vec::new();
+        provider
+            .stream(
+                TranslationRequest {
+                    content: "# Hello",
+                    target_language: "es",
+                },
+                &mut |text| {
+                    fragments.push(text.to_owned());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fragments, ["# Hola", "\n"]);
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0].starts_with(
+                "POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse HTTP/1.1"
+            )
+        );
+        assert!(
+            requests[0]
+                .to_lowercase()
+                .contains("x-goog-api-key: fake-secret")
+        );
+        assert!(!requests[0].lines().next().unwrap().contains("fake-secret"));
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "# Hello");
+        assert!(
+            body["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("es")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_gemini_stream_cut_off_before_stop() {
+        let event = json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]});
+        let (url, server) = http_server(vec![(
+            200,
+            "text/event-stream",
+            format!("data: {event}\n\n"),
+        )]);
+        let mut provider = Gemini::new(
+            Client::builder().no_proxy().build().unwrap(),
+            "gemini-test",
+            "fake-secret",
+        )
+        .unwrap();
+        provider.endpoint = url
+            .join("/v1beta/models/gemini-test:generateContent")
+            .unwrap();
+        let mut fragments = Vec::new();
+        let error = provider
+            .stream(
+                TranslationRequest {
+                    content: "hello",
+                    target_language: "es",
+                },
+                &mut |text| {
+                    fragments.push(text.to_owned());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(fragments, ["partial"]);
+        assert!(
+            error
+                .to_string()
+                .contains("stream ended before successful completion")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streams_text_and_accepts_a_separate_stop_event_without_exposing_thoughts() {
+        let mut state = StreamState::default();
+        let mut fragments = Vec::new();
+        let mut sink = |text: &str| {
+            fragments.push(text.to_owned());
+            Ok(())
+        };
+        for event in [
+            json!({"candidates": [{"content": {"parts": [{"thought": true, "text": "private reasoning"}]}}]}),
+            json!({"candidates": [{"content": {"parts": [{"text": "# Hola"}]}}]}),
+            json!({"candidates": [{"content": {"parts": [{"text": "\n"}]}}]}),
+            json!({"usageMetadata": {"candidatesTokenCount": 3}, "promptFeedback": {"blockReason": "BLOCK_REASON_UNSPECIFIED"}}),
+        ] {
+            assert!(
+                state
+                    .handle(&event.to_string(), &mut sink)
+                    .unwrap()
+                    .is_continue()
+            );
+        }
+        assert!(
+            state
+                .handle(r#"{"candidates":[{"finishReason":"STOP"}]}"#, &mut sink)
+                .unwrap()
+                .is_break()
+        );
+        assert_eq!(fragments, ["# Hola", "\n"]);
+    }
+
+    #[test]
+    fn rejects_blocked_truncated_and_thought_only_streams() {
+        for event in [
+            json!({"promptFeedback": {"blockReason": "SAFETY"}}),
+            json!({"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "partial"}]}}]}),
+            json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"thought": true, "text": "private"}]}}]}),
+        ] {
+            let mut fragments = Vec::new();
+            assert!(
+                StreamState::default()
+                    .handle(&event.to_string(), &mut |text| {
+                        fragments.push(text.to_owned());
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(fragments.is_empty());
+        }
     }
 
     #[test]

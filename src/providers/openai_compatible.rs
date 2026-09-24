@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, ops::ControlFlow, pin::Pin};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{
@@ -8,7 +8,7 @@ use reqwest::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::translate::{TranslationError, TranslationRequest, Translator};
+use crate::translate::{TextSink, TranslationError, TranslationRequest, Translator};
 
 pub struct OpenAiCompatible {
     client: Client,
@@ -68,6 +68,102 @@ impl Translator for OpenAiCompatible {
             .await?;
             response.markdown()
         })
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: TranslationRequest<'a>,
+        on_text: &'a mut TextSink<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TranslationError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut body = self.body(&request);
+            body["stream"] = json!(true);
+            let mut state = StreamState::default();
+            super::sse::consume(
+                self.client
+                    .post(self.endpoint.clone())
+                    .header(AUTHORIZATION, self.authorization.clone())
+                    .json(&body),
+                |data| state.handle(data, on_text),
+            )
+            .await
+        })
+    }
+}
+
+#[derive(Default)]
+struct StreamState {
+    stopped: bool,
+    has_text: bool,
+}
+
+#[derive(Deserialize)]
+struct StreamResponse {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    index: usize,
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+    refusal: Option<String>,
+}
+
+impl StreamState {
+    fn handle(
+        &mut self,
+        data: &str,
+        on_text: &mut TextSink<'_>,
+    ) -> Result<ControlFlow<()>, TranslationError> {
+        if data.trim() == "[DONE]" {
+            if !self.stopped || !self.has_text {
+                return Err(TranslationError::InvalidResponse(
+                    "stream completed without nonempty text and finish_reason=stop",
+                ));
+            }
+            return Ok(ControlFlow::Break(()));
+        }
+        let response: StreamResponse = super::sse::json(data)?;
+        // Usage-only events have no choices. Never mix different candidates.
+        let Some(choice) = response
+            .choices
+            .into_iter()
+            .find(|choice| choice.index == 0)
+        else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        if choice.delta.refusal.is_some() {
+            return Err(TranslationError::InvalidResponse(
+                "provider refused the translation",
+            ));
+        }
+        if choice
+            .finish_reason
+            .as_deref()
+            .is_some_and(|reason| reason != "stop")
+        {
+            return Err(TranslationError::InvalidResponse(
+                "generation incomplete or refused (expected finish_reason=stop)",
+            ));
+        }
+        if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
+            if self.stopped {
+                return Err(TranslationError::InvalidResponse(
+                    "text received after stream completion",
+                ));
+            }
+            self.has_text |= !text.trim().is_empty();
+            on_text(&text)?;
+        }
+        self.stopped |= choice.finish_reason.as_deref() == Some("stop");
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -140,6 +236,61 @@ mod tests {
         ] {
             assert!(OpenAiCompatible::new(Client::new(), base, "test".into(), "key").is_err());
         }
+    }
+
+    #[test]
+    fn streams_deltas_and_requires_stop_then_done() {
+        let mut state = StreamState::default();
+        let mut fragments = Vec::new();
+        let mut sink = |text: &str| {
+            fragments.push(text.to_owned());
+            Ok(())
+        };
+        for event in [
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "# Hé"}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "llo\n"}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"completion_tokens": 3}}),
+        ] {
+            assert!(
+                state
+                    .handle(&event.to_string(), &mut sink)
+                    .unwrap()
+                    .is_continue()
+            );
+        }
+        assert!(state.handle("[DONE]", &mut sink).unwrap().is_break());
+        assert_eq!(fragments, ["# Hé", "llo\n"]);
+        assert!(
+            StreamState::default()
+                .handle("[DONE]", &mut |_| Ok(()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_failed_streams_without_emitting_the_failed_chunk() {
+        for event in [
+            json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": "length"}]}),
+            json!({"choices": [{"delta": {"refusal": "refused"}, "finish_reason": "stop"}]}),
+            json!({"error": {"code": "insufficient_quota"}}),
+        ] {
+            let mut fragments = Vec::new();
+            assert!(
+                StreamState::default()
+                    .handle(&event.to_string(), &mut |text| {
+                        fragments.push(text.to_owned());
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(fragments.is_empty());
+        }
+        let mut state = StreamState::default();
+        let event =
+            json!({"choices": [{"delta": {"content": " "}, "finish_reason": "stop"}]}).to_string();
+        let _ = state.handle(&event, &mut |_| Ok(())).unwrap();
+        assert!(state.handle("[DONE]", &mut |_| Ok(())).is_err());
     }
 
     #[test]

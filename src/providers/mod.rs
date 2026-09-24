@@ -1,5 +1,6 @@
 pub mod gemini;
 pub mod openai_compatible;
+mod sse;
 
 use std::time::Duration;
 
@@ -18,15 +19,20 @@ fn transport(error: reqwest::Error) -> TranslationError {
     TranslationError::Transport(Box::new(error.without_url()))
 }
 
-async fn send_json<T: serde::de::DeserializeOwned>(
-    request: reqwest::RequestBuilder,
-) -> Result<T, TranslationError> {
+async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, TranslationError> {
     let response = request.send().await.map_err(transport)?;
     if !response.status().is_success() {
         // Response bodies may contain credentials or document contents.
         return Err(TranslationError::Http(response.status().as_u16()));
     }
-    response
+    Ok(response)
+}
+
+async fn send_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+) -> Result<T, TranslationError> {
+    send(request)
+        .await?
         .json()
         .await
         .map_err(|_| TranslationError::InvalidResponse("expected provider JSON schema"))

@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, pin::Pin};
+use std::{future::Future, io, path::Path, pin::Pin};
 
 use anyhow::{Context, Result};
 use thiserror::Error;
@@ -27,7 +27,11 @@ pub enum TranslationError {
     Http(u16),
     #[error("invalid provider response: {0}")]
     InvalidResponse(&'static str),
+    #[error("cannot write translated Markdown")]
+    Output(#[from] io::Error),
 }
+
+pub type TextSink<'a> = dyn FnMut(&str) -> io::Result<()> + Send + 'a;
 
 // A boxed future makes this async boundary dyn-compatible without a macro dependency.
 pub trait Translator {
@@ -35,6 +39,13 @@ pub trait Translator {
         &'a self,
         request: TranslationRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TranslationError>> + Send + 'a>>;
+
+    /// Emit text fragments as they arrive. An error may follow already emitted text.
+    fn stream<'a>(
+        &'a self,
+        request: TranslationRequest<'a>,
+        on_text: &'a mut TextSink<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TranslationError>> + Send + 'a>>;
 }
 
 pub async fn translate_file(
@@ -52,6 +63,29 @@ pub async fn translate_file(
             content: &content,
             target_language,
         })
+        .await
+        .context("translation failed")
+}
+
+pub async fn stream_file(
+    translator: &dyn Translator,
+    path: &Path,
+    target_language: &str,
+    on_text: &mut TextSink<'_>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read Markdown file {}", path.display()))?;
+    if content.is_empty() {
+        return Ok(());
+    }
+    translator
+        .stream(
+            TranslationRequest {
+                content: &content,
+                target_language,
+            },
+            on_text,
+        )
         .await
         .context("translation failed")
 }
@@ -74,6 +108,20 @@ mod tests {
                 Ok("# Hola\n`code`\n".into())
             })
         }
+
+        fn stream<'a>(
+            &'a self,
+            request: TranslationRequest<'a>,
+            on_text: &'a mut TextSink<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TranslationError>> + Send + 'a>> {
+            Box::pin(async move {
+                let text = self.translate(request).await?;
+                for fragment in text.split_inclusive('\n') {
+                    on_text(fragment)?;
+                }
+                Ok(())
+            })
+        }
     }
 
     #[tokio::test]
@@ -89,11 +137,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streams_fragments_without_modifying_source_and_propagates_sink_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.md");
+        std::fs::write(&path, "# Hello\n`code`\n").unwrap();
+        let mut fragments = Vec::new();
+        stream_file(&FakeTranslator, &path, "es", &mut |text| {
+            fragments.push(text.to_owned());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(fragments, ["# Hola\n", "`code`\n"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Hello\n`code`\n");
+        let error = stream_file(&FakeTranslator, &path, "es", &mut |_| {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<TranslationError>(), Some(TranslationError::Output(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[tokio::test]
     async fn missing_and_empty_files_do_not_call_provider() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.md");
         assert!(translate_file(&FakeTranslator, &path, "es").await.is_err());
+        let mut unexpected =
+            |_: &str| -> io::Result<()> { panic!("empty/missing files must not emit text") };
+        assert!(
+            stream_file(&FakeTranslator, &path, "es", &mut unexpected)
+                .await
+                .is_err()
+        );
         std::fs::write(&path, "").unwrap();
+        stream_file(&FakeTranslator, &path, "es", &mut unexpected)
+            .await
+            .unwrap();
         assert_eq!(
             translate_file(&FakeTranslator, &path, "es").await.unwrap(),
             ""
