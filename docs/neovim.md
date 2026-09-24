@@ -4,8 +4,6 @@ Requires Neovim 0.10+ and `mdtrans` on Neovim's `PATH`. Add this mapping to your
 
 `<leader>mt` translates the **saved file on disk**, opens a vertical split immediately, and appends stdout fragments as they arrive. The original buffer is untouched. Progress and failures use virtual lines, so they remain visible without becoming part of the Markdown or being written by `:w`.
 
-Replace older mappings that read `result.stdout` only in the exit callback: those still wait for the whole response. Live updates require the `stdout` callback used below.
-
 ```lua
 vim.keymap.set("n", "<leader>mt", function()
   local path = vim.api.nvim_buf_get_name(0)
