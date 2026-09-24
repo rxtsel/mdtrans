@@ -15,25 +15,9 @@ use clap::Parser;
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) if broken_pipe(&error) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mdtrans: {error:#}");
-            if let Some(translate::TranslationError::Http(status)) = error.downcast_ref() {
-                let hint = match status {
-                    401 => "API key rejected; check your environment or run mdtrans login.",
-                    403 => "Access denied; check API key permissions and project access.",
-                    404 => {
-                        "Model or API endpoint not found/available. Check config.toml; for Gemini, run mdtrans login gemini to discover models."
-                    }
-                    429 => {
-                        "Rate limit or quota exceeded; check provider quota/billing and retry later."
-                    }
-                    503 => {
-                        "Provider temporarily unavailable or overloaded. Try again later; no automatic retry was made."
-                    }
-                    _ => "Check provider availability and configuration.",
-                };
-                eprintln!("Hint: {hint}");
-            }
+            cli::report_error(&error);
             std::process::ExitCode::FAILURE
         }
     }
@@ -49,16 +33,39 @@ async fn run() -> Result<()> {
         None => (
             cli.file.context("a Markdown file is required")?,
             cli.lang,
-            if cli.stdout {
-                None
-            } else {
-                Some(preview::Editor::from_env()?)
-            },
+            None,
         ),
     };
     let config = config::Config::load()?;
     let translator = translator(&config.provider)?;
     let language = config.language(lang.as_deref());
+    if editor.is_none() && !cli.no_stream {
+        let mut stdout = io::stdout();
+        let mut emitted = false;
+        let mut spinner = Some(progress::Spinner::start(
+            "Translating… waiting for first text",
+        ));
+        let result = translate::stream_file(translator.as_ref(), &path, language, &mut |text| {
+            if !text.is_empty() {
+                // Clear the spinner before stdout starts; terminal redraws must
+                // never erase streamed text or compete with it on the same line.
+                spinner.take();
+                emitted = true;
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()?;
+            }
+            Ok(())
+        })
+        .await;
+        drop(spinner);
+        return result.map_err(|error| {
+            if emitted {
+                error.context("translation interrupted; partial Markdown was already written to stdout and is incomplete")
+            } else {
+                error
+            }
+        });
+    }
     let markdown = {
         let _spinner = progress::Spinner::start("Translating… waiting for provider");
         translate::translate_file(translator.as_ref(), &path, language).await?
@@ -73,6 +80,17 @@ async fn run() -> Result<()> {
     {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.context("cannot write translated Markdown to stdout"),
+    }
+}
+
+fn broken_pipe(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<translate::TranslationError>() {
+        Some(translate::TranslationError::Output(error)) => {
+            error.kind() == io::ErrorKind::BrokenPipe
+        }
+        _ => error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe),
     }
 }
 
